@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pytest-agent-behavior trace",
+  "description": "A sequential, single-run trace of agent tool calls and approval decisions. Array order defines event order. The Python loader additionally enforces unique tool_call call_id values and exact Python JSON types.",
+  "type": "object",
+  "required": ["schema_version", "events"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/toolCall"},
+          {"$ref": "#/$defs/approval"}
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "jsonValue": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "integer"},
+        {"type": "number"},
+        {"type": "string"},
+        {
+          "type": "array",
+          "items": {"$ref": "#/$defs/jsonValue"}
+        },
+        {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/jsonValue"}
+        }
+      ]
+    },
+    "toolCall": {
+      "type": "object",
+      "required": ["type", "call_id", "tool", "arguments"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "tool_call"},
+        "call_id": {"type": "string", "minLength": 1},
+        "tool": {"type": "string", "minLength": 1},
+        "arguments": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/jsonValue"}
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "required": ["type", "call_id", "tool", "decision"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "approval"},
+        "call_id": {"type": "string", "minLength": 1},
+        "tool": {"type": "string", "minLength": 1},
+        "decision": {"enum": ["approved", "denied"]}
+      }
+    }
+  }
+}

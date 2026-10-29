@@ -1,0 +1,465 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and publish, for example v0.1.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Validate tag and build distributions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate release tag and version
+        id: validate
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must look like vMAJOR.MINOR.PATCH: $TAG" >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          tag_commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "Checked-out source does not match tag $TAG" >&2
+            exit 1
+          fi
+
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          package_version="$(python -c 'import ast; tree=ast.parse(open("src/pytest_agent_behavior/__init__.py").read()); print(next(node.value.value for node in tree.body if isinstance(node, ast.Assign) and any(getattr(target, "id", None) == "__version__" for target in node.targets)))')"
+          if [ "$TAG" != "v${version}" ]; then
+            echo "Tag $TAG does not match project version $version" >&2
+            exit 1
+          fi
+          if [ "$version" != "$package_version" ]; then
+            echo "pyproject version $version does not match package version $package_version" >&2
+            exit 1
+          fi
+
+          remote_url="$(git remote get-url origin)"
+          case "$remote_url" in
+            *"github.com/VarunTx/pytest-agent-behavior"*) ;;
+            *)
+              echo "Unexpected repository remote: $remote_url" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "build>=1.2,<2" "twine>=5.1,<7"
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Check distributions
+        run: python -m twine check dist/*
+      - name: Record artifact hashes
+        run: sha256sum dist/* | tee SHA256SUMS
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: |
+            dist/
+            SHA256SUMS
+          if-no-files-found: error
+
+  verify-build:
+    name: Verify built artifacts before publication
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify artifact hashes
+        working-directory: release-artifacts
+        run: sha256sum -c SHA256SUMS
+      - name: Install wheel and verify installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install release-artifacts/dist/*.whl
+          python -m pip check
+          python - <<'PY'
+          import sysconfig
+          from pathlib import Path
+          from importlib.resources import files
+
+          import pytest_agent_behavior as package
+
+          purelib = Path(sysconfig.get_path("purelib")).resolve()
+          package_path = Path(package.__file__).resolve()
+          if not package_path.is_relative_to(purelib):
+              raise SystemExit(f"package did not import from site-packages: {package_path}")
+          root = files("pytest_agent_behavior")
+          for relative in ("py.typed", "schema/trace.schema.json"):
+              if not root.joinpath(relative).is_file():
+                  raise SystemExit(f"missing package data: {relative}")
+          print("import:", package_path)
+          print("version:", package.__version__)
+          PY
+      - name: Run clean consumer tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer"
+          cat > "$consumer/test_pass.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_pass(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {
+                              "type": "approval",
+                              "call_id": "c1",
+                              "tool": "send_email",
+                              "decision": "approved",
+                          },
+                          {
+                              "type": "tool_call",
+                              "call_id": "c1",
+                              "tool": "send_email",
+                              "arguments": {"to": "fake@example.com"},
+                          },
+                      ],
+                  }
+              )
+              check = agent_assertions(trace)
+              check.called("send_email", times=1)
+              check.requires_approval("send_email")
+          PY
+          cat > "$consumer/test_fail.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_fail(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {
+                              "type": "tool_call",
+                              "call_id": "c2",
+                              "tool": "send_email",
+                              "arguments": {"secret": "not-for-output"},
+                          }
+                      ],
+                  }
+              )
+              agent_assertions(trace).requires_approval("send_email")
+          PY
+          cd "$consumer"
+          pytest -q test_pass.py
+          if pytest -q --tb=short test_fail.py > failure.txt 2>&1; then
+            echo "expected the failing consumer test to fail" >&2
+            exit 1
+          fi
+          grep -q "Agent behavior assertion failed: requires_approval" failure.txt
+          if grep -q "not-for-output" <(sed -n '/Agent behavior assertion failed/,$p' failure.txt); then
+            echo "argument value leaked into library failure output" >&2
+            exit 1
+          fi
+      - name: Verify sdist builds a usable wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install "build>=1.2,<2"
+          mkdir -p "$RUNNER_TEMP/sdist-wheel" "$RUNNER_TEMP/sdist-venv"
+          python -m build --wheel --outdir "$RUNNER_TEMP/sdist-wheel" release-artifacts/dist/*.tar.gz
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/sdist-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/sdist-venv/bin/pip" install "$RUNNER_TEMP"/sdist-wheel/*.whl
+          "$RUNNER_TEMP/sdist-venv/bin/pip" check
+          "$RUNNER_TEMP/sdist-venv/bin/python" -c "import pytest_agent_behavior; print(pytest_agent_behavior.__version__)"
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: verify-build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/pytest-agent-behavior
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-artifacts
+      - name: Verify artifact hashes
+        working-directory: release-artifacts
+        run: sha256sum -c SHA256SUMS
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: release-artifacts/dist/
+          print-hash: true
+          skip-existing: false
+
+  verify-testpypi:
+    name: Verify the TestPyPI release
+    needs: [publish-testpypi, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-artifacts
+      - name: Verify artifact hashes
+        working-directory: release-artifacts
+        run: sha256sum -c SHA256SUMS
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies and exact TestPyPI release
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "pytest==9.2.0" "jsonschema>=4.21,<5"
+          for attempt in $(seq 1 12); do
+            if python -m pip install --no-cache-dir --no-deps \
+              --index-url https://test.pypi.org/simple/ \
+              "pytest-agent-behavior==${VERSION}"; then
+              exit 0
+            fi
+            echo "TestPyPI package not available yet; retrying ($attempt/12)"
+            sleep 10
+          done
+          echo "TestPyPI package did not become installable" >&2
+          exit 1
+      - name: Verify installed package and fixture behavior
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip check
+          python - <<'PY'
+          import os
+          import sysconfig
+          from pathlib import Path
+          from importlib.metadata import entry_points, version
+
+          import pytest_agent_behavior as package
+
+          expected = os.environ["VERSION"]
+          assert package.__version__ == expected, (package.__version__, expected)
+          assert version("pytest-agent-behavior") == expected
+          purelib = Path(sysconfig.get_path("purelib")).resolve()
+          package_path = Path(package.__file__).resolve()
+          assert package_path.is_relative_to(purelib), package_path
+          matches = [
+              entry
+              for entry in entry_points(group="pytest11")
+              if entry.name == "agent_behavior"
+          ]
+          assert matches and matches[0].value == "pytest_agent_behavior.plugin"
+          print("import:", package_path)
+          print("version:", package.__version__)
+          PY
+          consumer="$RUNNER_TEMP/testpypi-consumer"
+          mkdir -p "$consumer"
+          cat > "$consumer/test_pass.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_pass(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {"type": "approval", "call_id": "c1", "tool": "send_email", "decision": "approved"},
+                          {"type": "tool_call", "call_id": "c1", "tool": "send_email", "arguments": {}},
+                      ],
+                  }
+              )
+              check = agent_assertions(trace)
+              check.called("send_email", times=1)
+              check.requires_approval("send_email")
+          PY
+          cat > "$consumer/test_fail.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_fail(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {"type": "tool_call", "call_id": "c2", "tool": "send_email", "arguments": {}}
+                      ],
+                  }
+              )
+              agent_assertions(trace).requires_approval("send_email")
+          PY
+          cd "$consumer"
+          pytest -q test_pass.py
+          if pytest -q --tb=short test_fail.py > failure.txt 2>&1; then
+            echo "expected the failing consumer test to fail" >&2
+            exit 1
+          fi
+          grep -q "Agent behavior assertion failed: requires_approval" failure.txt
+
+  publish-pypi:
+    name: Publish the same artifacts to PyPI
+    needs: [verify-testpypi, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pytest-agent-behavior
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-artifacts
+      - name: Verify artifact hashes
+        working-directory: release-artifacts
+        run: sha256sum -c SHA256SUMS
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release-artifacts/dist/
+          print-hash: true
+
+  verify-pypi:
+    name: Verify the production PyPI release
+    needs: [publish-pypi, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: release-artifacts
+      - name: Verify artifact hashes
+        working-directory: release-artifacts
+        run: sha256sum -c SHA256SUMS
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install exact production release and verify
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          for attempt in $(seq 1 12); do
+            if python -m pip install --no-cache-dir "pytest-agent-behavior==${VERSION}"; then
+              break
+            fi
+            echo "PyPI package not available yet; retrying ($attempt/12)"
+            sleep 10
+            if [ "$attempt" -eq 12 ]; then
+              echo "PyPI package did not become installable" >&2
+              exit 1
+            fi
+          done
+          python -m pip check
+          python - <<'PY'
+          import os
+          import sysconfig
+          from pathlib import Path
+          from importlib.metadata import entry_points, version
+
+          import pytest_agent_behavior as package
+
+          expected = os.environ["VERSION"]
+          assert package.__version__ == expected, (package.__version__, expected)
+          assert version("pytest-agent-behavior") == expected
+          purelib = Path(sysconfig.get_path("purelib")).resolve()
+          package_path = Path(package.__file__).resolve()
+          assert package_path.is_relative_to(purelib), package_path
+          matches = [
+              entry
+              for entry in entry_points(group="pytest11")
+              if entry.name == "agent_behavior"
+          ]
+          assert matches and matches[0].value == "pytest_agent_behavior.plugin"
+          print("import:", package_path)
+          print("version:", package.__version__)
+          PY
+          consumer="$RUNNER_TEMP/pypi-consumer"
+          mkdir -p "$consumer"
+          cat > "$consumer/test_pass.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_pass(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {"type": "approval", "call_id": "c1", "tool": "send_email", "decision": "approved"},
+                          {"type": "tool_call", "call_id": "c1", "tool": "send_email", "arguments": {}},
+                      ],
+                  }
+              )
+              check = agent_assertions(trace)
+              check.called("send_email", times=1)
+              check.requires_approval("send_email")
+          PY
+          cat > "$consumer/test_fail.py" <<'PY'
+          from pytest_agent_behavior import Trace
+
+
+          def test_fail(agent_assertions):
+              trace = Trace.from_dict(
+                  {
+                      "schema_version": 1,
+                      "events": [
+                          {"type": "tool_call", "call_id": "c2", "tool": "send_email", "arguments": {}}
+                      ],
+                  }
+              )
+              agent_assertions(trace).requires_approval("send_email")
+          PY
+          cd "$consumer"
+          pytest -q test_pass.py
+          if pytest -q --tb=short test_fail.py > failure.txt 2>&1; then
+            echo "expected the failing consumer test to fail" >&2
+            exit 1
+          fi
+          grep -q "Agent behavior assertion failed: requires_approval" failure.txt
