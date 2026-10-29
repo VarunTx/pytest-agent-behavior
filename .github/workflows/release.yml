@@ -22,11 +22,11 @@ jobs:
     outputs:
       version: ${{ steps.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Validate release tag and version
@@ -73,7 +73,7 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "build>=1.2,<2" "twine>=5.1,<7"
+          python -m pip install "build>=1.2,<2" "twine>=7,<8"
       - name: Build wheel and sdist
         run: python -m build
       - name: Check distributions
@@ -81,7 +81,7 @@ jobs:
       - name: Record artifact hashes
         run: sha256sum dist/* | tee SHA256SUMS
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-dist
           path: |
@@ -94,11 +94,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: release-artifacts
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Verify artifact hashes
@@ -218,7 +218,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: release-artifacts
@@ -238,14 +238,14 @@ jobs:
     needs: [publish-testpypi, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: release-artifacts
       - name: Verify artifact hashes
         working-directory: release-artifacts
         run: sha256sum -c SHA256SUMS
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install dependencies and exact TestPyPI release
@@ -351,7 +351,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: release-artifacts
@@ -369,14 +369,14 @@ jobs:
     needs: [publish-pypi, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-dist
           path: release-artifacts
       - name: Verify artifact hashes
         working-directory: release-artifacts
         run: sha256sum -c SHA256SUMS
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install exact production release and verify
