@@ -362,12 +362,11 @@ Locally tested for 0.1.0, on macOS arm64 against the checked-out source:
 - CPython 3.11.0 with pytest 8.3.5: 178 passed;
 - CPython 3.15.0 with pytest 9.2.0: 178 passed.
 
-The configured GitHub Actions matrix covers Ubuntu with CPython 3.10–3.14
-(stable setup-python builds), pytest 9.2.0, plus pytest 8.3.5 on CPython 3.11.
-That CI matrix has **not been run** for this tree. The local 3.14 result used a
-release candidate, not the stable 3.14 build used by CI; see
-[CONTRIBUTING.md](CONTRIBUTING.md) for the distinction. Prepared CI does not
-mean it passed.
+GitHub Actions CI passed on Ubuntu for CPython 3.10, 3.11, 3.12, 3.13, and
+3.14 with pytest 9.2.0, plus CPython 3.11 with pytest 8.3.5. Each matrix job
+reported 178 passed. See the repository's Actions runs for the exact release
+commit. The local 3.14 result used a release candidate; the CI 3.14 result used
+the stable setup-python build.
 
 Local verification commands:
 

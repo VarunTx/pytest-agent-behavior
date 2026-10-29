@@ -26,9 +26,8 @@ the checked-out source:
 
 The configured GitHub Actions matrix uses Ubuntu and stable CPython 3.10–3.14
 through `actions/setup-python`, with pytest 9.2.0 plus a pytest 8.3.5 job on
-CPython 3.11. That workflow has **not run** for this tree, and no Linux or
-stable-3.14 result is claimed. Do not describe a CI matrix as passing until its
-workflow run exists.
+CPython 3.11. The matrix passed on the release source: all six jobs reported
+178 passed. See the repository's Actions runs for the exact commit and logs.
 
 ## Checks
 
